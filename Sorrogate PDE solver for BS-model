@@ -1,0 +1,335 @@
+# import numpy as np
+# import pandas as pd
+# import torch
+# import torch.nn as nn
+# import torch.optim as optim
+# import matplotlib.pyplot as plt
+# from torch.utils.data import TensorDataset, DataLoader
+# from scipy.stats import norm
+# from sklearn.model_selection import train_test_split
+
+# # Define the Black–Scholes closed-form solution for a European call option.
+# def black_scholes_call(S, t, sigma, r, K=100, T=1):
+#     # If at maturity, the option price is the intrinsic value.
+#     if T - t < 1e-8:
+#         return max(S - K, 0.0)
+#     # Calculate d1 and d2.
+#     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * (T - t)) / (sigma * np.sqrt(T - t))
+#     d2 = d1 - sigma * np.sqrt(T - t)
+#     price = S * norm.cdf(d1) - K * np.exp(-r * (T - t)) * norm.cdf(d2)
+#     return price
+
+# # Generate the supervised dataset.
+# np.random.seed(42)
+# num_samples = 10000
+# S_min, S_max = 1, 200  # Stock price range (avoid S=0 for log)
+# T = 1.0               # Maturity
+# K = 100.0             # Strike price
+
+# # Randomly sample input parameters.
+# S_samples = np.random.uniform(S_min, S_max, num_samples)
+# t_samples = np.random.uniform(0, T, num_samples)
+# sigma_samples = np.random.uniform(0.1, 0.5, num_samples)
+# r_samples = np.random.uniform(0.01, 0.1, num_samples)
+
+# # Compute option prices using the analytic solution.
+# prices = np.array([black_scholes_call(S, t, sigma, r, K, T)
+#                    for S, t, sigma, r in zip(S_samples, t_samples, sigma_samples, r_samples)])
+
+# # Create a DataFrame (optional, for visualization and further use).
+# df = pd.DataFrame({
+#     'S': S_samples,
+#     't': t_samples,
+#     'sigma': sigma_samples,
+#     'r': r_samples,
+#     'price': prices
+# })
+
+# print("Dataset sample:")
+# print(df.head())
+
+# # Prepare features (inputs) and targets (output).
+# X = df[['S', 't', 'sigma', 'r']].values.astype(np.float32)
+# y = df['price'].values.astype(np.float32).reshape(-1, 1)
+
+# # Split the data into training and testing sets.
+# X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# # Convert the NumPy arrays into PyTorch tensors.
+# X_train_tensor = torch.from_numpy(X_train)
+# y_train_tensor = torch.from_numpy(y_train)
+# X_test_tensor = torch.from_numpy(X_test)
+# y_test_tensor = torch.from_numpy(y_test)
+
+# # Create PyTorch DataLoaders for batch processing.
+# train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+# test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+# train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+# test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+# # Define a simple multilayer perceptron (MLP) model.
+# class MLP(nn.Module):
+#     def __init__(self, input_dim=4, hidden_dim=64, output_dim=1):
+#         super(MLP, self).__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(input_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, hidden_dim),
+#             nn.ReLU(),
+#             nn.Linear(hidden_dim, output_dim)
+#         )
+        
+#     def forward(self, x):
+#         return self.net(x)
+
+# # Instantiate the model, define the loss function and the optimizer.
+# model = MLP()
+# criterion = nn.MSELoss()
+# optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# # Prepare to track loss history.
+# train_losses = []
+# test_losses = []
+
+# # Training loop.
+# num_epochs = 200
+# for epoch in range(num_epochs):
+#     model.train()
+#     train_loss = 0.0
+#     for features, target in train_loader:
+#         optimizer.zero_grad()
+#         outputs = model(features)
+#         loss = criterion(outputs, target)
+#         loss.backward()
+#         optimizer.step()
+#         train_loss += loss.item() * features.size(0)
+#     train_loss /= len(train_loader.dataset)
+    
+#     # Evaluate on the test set every 20 epochs.
+#     if (epoch + 1) % 20 == 0:
+#         model.eval()
+#         test_loss = 0.0
+#         with torch.no_grad():
+#             for features, target in test_loader:
+#                 outputs = model(features)
+#                 loss = criterion(outputs, target)
+#                 test_loss += loss.item() * features.size(0)
+#         test_loss /= len(test_loader.dataset)
+#         train_losses.append(train_loss)
+#         test_losses.append(test_loss)
+#         print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
+
+# # Compare predictions vs. true values for a few test samples.
+# model.eval()
+# with torch.no_grad():
+#     sample_indices = np.random.choice(len(X_test), size=5, replace=False)
+#     sample_features = X_test_tensor[sample_indices]
+#     sample_targets = y_test_tensor[sample_indices]
+#     sample_predictions = model(sample_features)
+    
+#     print("\nSample Predictions vs True Values:")
+#     for i in range(5):
+#         inp = sample_features[i].numpy()
+#         pred = sample_predictions[i].item()
+#         true_val = sample_targets[i].item()
+#         print(f"Input (S, t, sigma, r): {inp}, Prediction: {pred:.4f}, True: {true_val:.4f}")
+
+# # Evaluate model on full test set for visualization.
+# model.eval()
+# with torch.no_grad():
+#     y_pred = model(X_test_tensor).numpy()
+
+# # --- Visualization: Loss Curves ---
+# plt.figure(1)  # First window.
+# # Adjust x-axis to reflect the recorded epochs (every 20 epochs).
+# epochs_plot = np.arange(20, num_epochs + 1, 20)
+# plt.plot(epochs_plot, train_losses, label='Train Loss')
+# plt.plot(epochs_plot, test_losses, label='Test Loss')
+# plt.xlabel('Epoch')
+# plt.ylabel('Loss (MSE)')
+# plt.title('Training and Test Loss over Epochs')
+# plt.legend()
+# plt.grid(True)
+
+# # --- Visualization: Scatter Plot of Predictions ---
+# plt.figure(2)  # Second window.
+# plt.scatter(y_test, y_pred, alpha=0.5)
+# plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+# plt.xlabel('True Price')
+# plt.ylabel('Predicted Price')
+# plt.title('Predicted vs. True Option Prices')
+# plt.grid(True)
+
+# # Display all figures at the end of the program.
+# plt.show()
+
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader
+from scipy.stats import norm
+from sklearn.model_selection import train_test_split
+
+# --- Black-Scholes Analytic Solution (Vectorized) ---
+def black_scholes_call(S, t, sigma, r, K=100, T=1):
+    """
+    Computes the European call option price using the Black-Scholes formula.
+    Vectorized implementation using np.where to handle tau near zero.
+    """
+    tau = T - t  # time to maturity
+    if tau < 1e-8:
+        return max(S - K, 0.0)
+    # For tau very close to 0, define payoff explicitly.
+    d1 = np.where(tau > 1e-8, (np.log(S/K) + (r + 0.5 * sigma**2) * tau) / (sigma * np.sqrt(tau)), 0.0)
+    d2 = np.where(tau > 1e-8, d1 - sigma * np.sqrt(tau), 0.0)
+    price = np.where(tau > 1e-8,
+                     S * norm.cdf(d1) - K * np.exp(-r * tau) * norm.cdf(d2),
+                     np.maximum(S - K, 0.0))
+    return price
+
+# --- Generate the Supervised Dataset ---
+np.random.seed(42)
+num_samples = 10000
+S_min, S_max = 1, 200  # Stock price range (avoiding S=0)
+T = 1.0               # Maturity time
+K = 100.0             # Strike price
+
+# Sample inputs uniformly.
+S_samples = np.random.uniform(S_min, S_max, num_samples)
+t_samples = np.random.uniform(0, T, num_samples)
+sigma_samples = np.random.uniform(0.1, 0.5, num_samples)
+r_samples = np.random.uniform(0.01, 0.1, num_samples)
+
+# Compute option prices using the analytic solution.
+prices = black_scholes_call(S_samples, t_samples, sigma_samples, r_samples, K, T)
+
+# Create a DataFrame for further processing and visualization.
+df = pd.DataFrame({
+    'S': S_samples,
+    't': t_samples,
+    'sigma': sigma_samples,
+    'r': r_samples,
+    'price': prices
+})
+print("Dataset sample:")
+print(df.head())
+
+# --- Prepare Features and Targets ---
+X = df[['S', 't', 'sigma', 'r']].values.astype(np.float32)
+y = df['price'].values.astype(np.float32).reshape(-1, 1)
+
+# Split the data into training and testing sets.
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Convert NumPy arrays into PyTorch tensors.
+X_train_tensor = torch.from_numpy(X_train)
+y_train_tensor = torch.from_numpy(y_train)
+X_test_tensor = torch.from_numpy(X_test)
+y_test_tensor = torch.from_numpy(y_test)
+
+# Create PyTorch DataLoaders for batch processing.
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+# --- Define the Neural Network Model ---
+class MLP(nn.Module):
+    def __init__(self, input_dim=4, hidden_dim=64, output_dim=1):
+        super(MLP, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+model = MLP()
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# --- Training Loop with Loss Tracking ---
+num_epochs = 200
+train_losses = []
+test_losses = []
+
+for epoch in range(num_epochs):
+    model.train()
+    running_train_loss = 0.0
+    for features, target in train_loader:
+        optimizer.zero_grad()
+        outputs = model(features)
+        loss = criterion(outputs, target)
+        loss.backward()
+        optimizer.step()
+        running_train_loss += loss.item() * features.size(0)
+    train_loss = running_train_loss / len(train_loader.dataset)
+    
+    # Evaluate on the test set every 20 epochs.
+    if (epoch + 1) % 20 == 0:
+        model.eval()
+        running_test_loss = 0.0
+        with torch.no_grad():
+            for features, target in test_loader:
+                outputs = model(features)
+                loss = criterion(outputs, target)
+                running_test_loss += loss.item() * features.size(0)
+        test_loss = running_test_loss / len(test_loader.dataset)
+        train_losses.append(train_loss)
+        test_losses.append(test_loss)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}")
+
+# --- Save the Trained Model ---
+torch.save(model.state_dict(), "black_scholes_surrogate_model.pth")
+print("Model saved as black_scholes_surrogate_model.pth")
+
+# --- Compare Sample Predictions ---
+model.eval()
+with torch.no_grad():
+    sample_indices = np.random.choice(len(X_test), size=5, replace=False)
+    sample_features = X_test_tensor[sample_indices]
+    sample_targets = y_test_tensor[sample_indices]
+    sample_predictions = model(sample_features)
+    
+    print("\nSample Predictions vs True Values:")
+    for i in range(5):
+        inp = sample_features[i].numpy()
+        pred = sample_predictions[i].item()
+        true_val = sample_targets[i].item()
+        print(f"Input (S, t, sigma, r): {inp}, Prediction: {pred:.4f}, True: {true_val:.4f}")
+
+# --- Evaluate on Full Test Set for Visualization ---
+model.eval()
+with torch.no_grad():
+    y_pred = model(X_test_tensor).numpy()
+
+# --- Visualization: Loss Curves ---
+plt.figure(figsize=(8, 6))
+epochs_plot = np.arange(20, num_epochs + 1, 20)
+plt.plot(epochs_plot, train_losses, label='Train Loss', marker='o')
+plt.plot(epochs_plot, test_losses, label='Test Loss', marker='o')
+plt.xlabel('Epoch')
+plt.ylabel('Loss (MSE)')
+plt.title('Training and Test Loss over Epochs')
+plt.legend()
+plt.grid(True)
+
+# --- Visualization: Scatter Plot of Predictions ---
+plt.figure(figsize=(8, 6))
+plt.scatter(y_test, y_pred, alpha=0.5)
+plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--')
+plt.xlabel('True Price')
+plt.ylabel('Predicted Price')
+plt.title('Predicted vs. True Option Prices')
+plt.grid(True)
+
+# Display all figures.
+plt.show()
