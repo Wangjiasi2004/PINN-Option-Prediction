@@ -7,10 +7,11 @@ import matplotlib.pyplot as plt
 from scipy.stats import norm
 import time
 import os
-from torch.utils.data import TensorDataset, DataLoader # Import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import TensorDataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
 
-# --- Black-Scholes pricing function ---
-# (Keep the black_scholes_call function definition here as before)
+# --- Black‑Scholes pricing function (unchanged) ---
 def black_scholes_call(S, K, T, r, sigma):
     eps = 1e-8
     S_arr, K_arr, T_arr, sigma_arr = np.asarray(S), np.asarray(K), np.asarray(T), np.asarray(sigma)
@@ -21,94 +22,101 @@ def black_scholes_call(S, K, T, r, sigma):
     d1 = (np.log(S_arr / K_arr) + (r + 0.5 * sigma_arr**2) * T_arr) / (sigma_arr * np.sqrt(T_arr))
     d2 = d1 - sigma_arr * np.sqrt(T_arr)
     price = S_arr * norm.cdf(d1) - K_arr * np.exp(-r * T_arr) * norm.cdf(d2)
-    price = np.maximum(price, 0)
-    return price
+    return np.maximum(price, 0)
 
 # --- Hyperparameters & Setup ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 hidden_dim = 128
-learning_rate = 1e-4 # Initial learning rate
-num_epochs = 2 # Increase epochs as tuning takes time
+learning_rate = 1e-4
+num_epochs = 2
 log_frequency = 100
-batch_size = 4096 # Define batch size for efficient training
-
-# Fixed risk-free rate assumption for PDE calculation
+batch_size = 4096
 r_fixed = 0.05
 
-# Model save path
 MODEL_SAVE_DIR = "pinn_market_models_adaptive"
 MODEL_FILENAME = "bs_market_pinn_aapl_adaptive.pth"
-MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, MODEL_FILENAME)
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
+MODEL_SAVE_PATH = os.path.join(MODEL_SAVE_DIR, MODEL_FILENAME)
 
 # --- Load and preprocess real AAPL options data ---
 print("Loading data...")
 csv_file_path = "aapl_2016_2020.csv"
 try:
     df = pd.read_csv(csv_file_path, low_memory=False)
-    print(f"Data loaded successfully from {csv_file_path}.")
-    df.columns = df.columns.str.strip()
-    df.columns = df.columns.str.replace('[', '', regex=False).str.replace(']', '', regex=False)
-    df.columns = df.columns.str.strip()
-    print(f"Cleaned columns: {df.columns.tolist()}")
-    cols_needed = ['QUOTE_DATE', 'EXPIRE_DATE', 'UNDERLYING_LAST', 'C_LAST', 'STRIKE', 'C_IV']
-    missing_cols = [col for col in cols_needed if col not in df.columns]
-    if missing_cols:
-        print(f"Error: Required columns not found: {missing_cols}")
-        exit()
+    df.columns = df.columns.str.strip().str.replace('[','').str.replace(']','').str.strip()
+    cols_needed = ['QUOTE_DATE','EXPIRE_DATE','UNDERLYING_LAST','C_LAST','STRIKE','C_IV']
+    missing = [c for c in cols_needed if c not in df.columns]
+    if missing:
+        print(f"Error: Required columns not found: {missing}"); exit()
     df = df[cols_needed]
-    print("Selected necessary columns.")
 except FileNotFoundError:
-    print(f"Error: {csv_file_path} not found.")
-    exit()
+    print(f"Error: {csv_file_path} not found."); exit()
 except Exception as e:
-    print(f"Error loading or processing CSV: {e}")
-    exit()
+    print(f"Error loading CSV: {e}"); exit()
 
 print("Preprocessing data...")
-df['QUOTE_DATE'] = pd.to_datetime(df['QUOTE_DATE'], errors='coerce')
+df['QUOTE_DATE']  = pd.to_datetime(df['QUOTE_DATE'], errors='coerce')
 df['EXPIRE_DATE'] = pd.to_datetime(df['EXPIRE_DATE'], errors='coerce')
-df['t_years'] = (df['EXPIRE_DATE'] - df['QUOTE_DATE']).dt.days / 365.0
-numeric_cols = ['UNDERLYING_LAST', 'C_LAST', 'STRIKE', 'C_IV']
-for col in numeric_cols:
-     df[col] = pd.to_numeric(df[col], errors='coerce')
-subset_to_check = ['UNDERLYING_LAST', 'C_LAST', 't_years', 'STRIKE', 'C_IV', 'QUOTE_DATE', 'EXPIRE_DATE']
-df = df.dropna(subset=subset_to_check)
-df = df[(df['t_years'] > 1e-3) & (df['C_LAST'] > 0) & (df['STRIKE'] > 0) & (df['UNDERLYING_LAST'] > 0) & (df['C_IV'] > 1e-3)]
-print(f"Number of valid data points after cleaning: {len(df)}")
-if len(df) == 0:
-    print("Error: No valid data points found.")
-    exit()
+df['t_years']     = (df['EXPIRE_DATE'] - df['QUOTE_DATE']).dt.days / 365.0
+for col in ['UNDERLYING_LAST','C_LAST','STRIKE','C_IV']:
+    df[col] = pd.to_numeric(df[col], errors='coerce')
+df.dropna(subset=['UNDERLYING_LAST','C_LAST','t_years','STRIKE','C_IV','QUOTE_DATE','EXPIRE_DATE'], inplace=True)
+df = df[(df['t_years']>1e-3)&(df['C_LAST']>0)&(df['STRIKE']>0)&(df['UNDERLYING_LAST']>0)&(df['C_IV']>1e-3)]
+print(f"Valid data points: {len(df)}")
+if len(df)==0: exit()
 
 # --- Prepare Tensors ---
-S_data = torch.tensor(df['UNDERLYING_LAST'].values.reshape(-1, 1), dtype=torch.float32)
-t_data = torch.tensor(df['t_years'].values.reshape(-1, 1), dtype=torch.float32)
-K_data = torch.tensor(df['STRIKE'].values.reshape(-1, 1), dtype=torch.float32)
-sigma_data = torch.tensor(df['C_IV'].values.reshape(-1, 1), dtype=torch.float32)
-price_data = torch.tensor(df['C_LAST'].values.reshape(-1, 1), dtype=torch.float32)
+S_data     = torch.tensor(df['UNDERLYING_LAST'].values, dtype=torch.float32).unsqueeze(1)
+t_data     = torch.tensor(df['t_years'].values,        dtype=torch.float32).unsqueeze(1)
+K_data     = torch.tensor(df['STRIKE'].values,         dtype=torch.float32).unsqueeze(1)
+sigma_data = torch.tensor(df['C_IV'].values,           dtype=torch.float32).unsqueeze(1)
+price_data = torch.tensor(df['C_LAST'].values,         dtype=torch.float32).unsqueeze(1)
 
-# --- Normalization ---
-S_mean, S_std = S_data.mean(), S_data.std()
-t_mean, t_std = t_data.mean(), t_data.std()
-K_mean, K_std = K_data.mean(), K_data.std()
+# --- Normalization (CPU) ---
+S_mean, S_std     = S_data.mean(), S_data.std()
+t_mean, t_std     = t_data.mean(), t_data.std()
+K_mean, K_std     = K_data.mean(), K_data.std()
 sigma_mean, sigma_std = sigma_data.mean(), sigma_data.std()
-norm_constants = {'S_mean': S_mean, 'S_std': S_std, 't_mean': t_mean, 't_std': t_std,
-                  'K_mean': K_mean, 'K_std': K_std, 'sigma_mean': sigma_mean, 'sigma_std': sigma_std}
-print("Normalization constants:", norm_constants)
-S_norm = (S_data - S_mean) / S_std
-t_norm = (t_data - t_mean) / t_std
-K_norm = (K_data - K_mean) / K_std
-sigma_norm = (sigma_data - sigma_mean) / sigma_std
+print("Normalization constants:", {
+    'S_mean': S_mean.item(),'S_std': S_std.item(),
+    't_mean': t_mean.item(),'t_std': t_std.item(),
+    'K_mean': K_mean.item(),'K_std': K_std.item(),
+    'sigma_mean': sigma_mean.item(),'sigma_std': sigma_std.item(),
+})
 
-# --- Create DataLoader for Batching ---
-# Combine all necessary tensors into a dataset
-dataset = TensorDataset(S_norm, t_norm, K_norm, sigma_norm, price_data)
-# Create a DataLoader to handle batching and shuffling
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True if device=='cuda' else False)
-print(f"Created DataLoader with batch size {batch_size}")
+# Move norms to GPU and clamp
+norm_constants = {
+    'S_mean':   S_mean.to(device),
+    'S_std':    S_std.to(device).clamp_min(1e-8),
+    't_mean':   t_mean.to(device),
+    't_std':    t_std.to(device).clamp_min(1e-8),
+    'K_mean':   K_mean.to(device),
+    'K_std':    K_std.to(device).clamp_min(1e-8),
+    'sigma_mean': sigma_mean.to(device),
+    'sigma_std':  sigma_std.to(device).clamp_min(1e-8),
+}
 
-# --- Define Parametric PINN Model ---
+# Normalize on GPU
+S_norm_cpu     = (S_data     - S_mean)   / S_std
+t_norm_cpu     = (t_data     - t_mean)   / t_std
+K_norm_cpu     = (K_data     - K_mean)   / K_std
+sigma_norm_cpu = (sigma_data - sigma_mean) / sigma_std
+price_cpu      = price_data.clone()  # still CPU
+
+# Create CPU‑based DataLoader
+dataset = TensorDataset(S_norm_cpu, t_norm_cpu, K_norm_cpu, sigma_norm_cpu, price_cpu)
+dataloader = DataLoader(
+    dataset,
+    batch_size = batch_size,
+    shuffle = True,
+    num_workers = 0,
+    pin_memory = True,
+    # persistent_workers = False
+)
+print(f"Created CPU-based DataLoader (bs={batch_size}, wks=4)")
+
+# --- Parametric PINN Model ---
 class MarketPINN(nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
@@ -126,130 +134,144 @@ class MarketPINN(nn.Module):
         x = torch.cat([S_n, t_n, K_n, sigma_n], dim=1)
         return self.net(x)
 
-# --- Loss Functions ---
-# (Keep data_loss_fn and pde_loss_fn definitions exactly as in the previous working version)
-def data_loss_fn(model, S_n, t_n, K_n, sigma_n, target_price):
-    predicted_price = model(S_n, t_n, K_n, sigma_n)
-    loss = torch.mean((predicted_price - target_price)**2)
-    return loss
-
-def pde_loss_fn(model, S_n, t_n, K_n, sigma_n, r, norm_const):
-    S_n_grad = S_n.clone().detach().requires_grad_(True)
-    t_n_grad = t_n.clone().detach().requires_grad_(True)
-    K_n_fixed = K_n.detach()
-    sigma_n_fixed = sigma_n.detach()
-    u = model(S_n_grad, t_n_grad, K_n_fixed, sigma_n_fixed)
-    grad_outputs_u = torch.ones_like(u)
-    u_t_norm = torch.autograd.grad(u, t_n_grad, grad_outputs=grad_outputs_u, create_graph=True)[0]
-    u_S_norm = torch.autograd.grad(u, S_n_grad, grad_outputs=grad_outputs_u, create_graph=True)[0]
-    grad_outputs_u_S_norm = torch.ones_like(u_S_norm)
-    u_SS_norm = torch.autograd.grad(u_S_norm, S_n_grad, grad_outputs=grad_outputs_u_S_norm, create_graph=True)[0]
-    t_std = norm_const['t_std'] if norm_const['t_std'] > 1e-8 else torch.tensor(1.0)
-    S_std = norm_const['S_std'] if norm_const['S_std'] > 1e-8 else torch.tensor(1.0)
-    u_t = u_t_norm / t_std
-    u_S = u_S_norm / S_std
-    u_SS = u_SS_norm / (S_std**2)
-    S = S_n * norm_const['S_std'] + norm_const['S_mean']
-    sigma = sigma_n * norm_const['sigma_std'] + norm_const['sigma_mean']
-    S_clamped = torch.clamp(S, min=1e-4)
-    sigma_clamped = torch.clamp(sigma, min=1e-4)
-    residual = u_t + r * S_clamped * u_S + 0.5 * (sigma_clamped**2) * (S_clamped**2) * u_SS - r * u
-    loss_f = torch.mean(residual**2)
-    return loss_f
-
-# --- Initialize Model, Optimizer, and Learnable Weights ---
 model = MarketPINN(hidden_dim).to(device)
 
-# Define learnable parameters for loss weights (log variances)
-log_var_data = nn.Parameter(torch.tensor(0.0, device=device)) # Initialize log variances around 0
-log_var_pde = nn.Parameter(torch.tensor(0.0, device=device))
+# --- Torch‑Compile (PyTorch 2.0+) ---
+# if hasattr(torch, "compile"):
+#     model = torch.compile(model)
 
-# Optimizer includes model parameters AND the learnable log variances
+
+# --- Loss Functions (minor change: clamp norms instead of creating new tensors) ---
+def data_loss_fn(model, S_n, t_n, K_n, sigma_n, target):
+    pred = model(S_n, t_n, K_n, sigma_n)
+    return torch.mean((pred - target)**2)
+
+def pde_loss_fn(model, S_n, t_n, K_n, sigma_n, r, norm_const):
+    # make S and t require grads
+    S_req = S_n.clone().detach().requires_grad_(True)
+    t_req = t_n.clone().detach().requires_grad_(True)
+    # forward
+    u = model(S_req, t_req, K_n, sigma_n)
+    ones = torch.ones_like(u)
+
+    # first derivatives (allow_unused to avoid the “unused Tensor” error)
+    u_t_norm = torch.autograd.grad(
+        u, t_req, grad_outputs=ones, create_graph=True, allow_unused=True
+    )[0]
+    if u_t_norm is None:
+        u_t_norm = torch.zeros_like(u)
+
+    u_S_norm = torch.autograd.grad(
+        u, S_req, grad_outputs=ones, create_graph=True, allow_unused=True
+    )[0]
+    if u_S_norm is None:
+        u_S_norm = torch.zeros_like(u)
+
+    # second derivative
+    grad_uS = torch.ones_like(u_S_norm)
+    u_SS_norm = torch.autograd.grad(
+        u_S_norm, S_req, grad_outputs=grad_uS, create_graph=True, allow_unused=True
+    )[0]
+    if u_SS_norm is None:
+        u_SS_norm = torch.zeros_like(u)
+
+    # un-normalize the derivatives
+    u_t = u_t_norm / norm_const['t_std']
+    u_S = u_S_norm / norm_const['S_std']
+    u_SS = u_SS_norm / (norm_const['S_std'] ** 2)
+
+    # physical S and sigma
+    S_phys = S_req * norm_const['S_std'] + norm_const['S_mean']
+    sigma_phys = sigma_n * norm_const['sigma_std'] + norm_const['sigma_mean']
+    S_phys = torch.clamp(S_phys, min=1e-4)
+    sigma_phys = torch.clamp(sigma_phys, min=1e-4)
+
+    # residual
+    res = u_t + r * S_phys * u_S + 0.5 * (sigma_phys ** 2) * (S_phys ** 2) * u_SS - r * u
+    return torch.mean(res ** 2)
+
+# --- Optimizer, Scaler, Scheduler ---
+log_var_data = nn.Parameter(torch.tensor(0.0, device=device))
+log_var_pde  = nn.Parameter(torch.tensor(0.0, device=device))
 optimizer = optim.Adam([
     {'params': model.parameters()},
-    {'params': [log_var_data, log_var_pde], 'lr': learning_rate * 0.1} # Use smaller LR for weights potentially
-], lr=learning_rate)
+    {'params': [log_var_data, log_var_pde], 'lr': learning_rate * 0.1}], lr=learning_rate)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=100, verbose=True)
+scaler = GradScaler()
 
-# Scheduler monitors the total loss
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=100, verbose=True) # Increased patience
-
-
-# --- Training Loop with Adaptive Weights and Batching ---
+# --- Training Loop with AMP ---
 losses_total_epoch = []
-losses_data_epoch = []
-losses_pde_epoch = []
-log_var_data_hist = []
-log_var_pde_hist = []
+losses_data_epoch  = []
+losses_pde_epoch   = []
+log_var_data_hist  = []
+log_var_pde_hist   = []
 
-print(f"Starting training with adaptive weights...")
+print("Starting training with AMP and compile optimizations...")
 start_time = time.time()
 
 for epoch in range(num_epochs):
     model.train()
-    epoch_loss_total = 0.0
-    epoch_loss_data = 0.0
-    epoch_loss_pde = 0.0
-    num_batches = 0
+    tot_d = tot_p = tot_t = 0.0
+    batches = 0
+    avg_d = avg_p = avg_t = 0.0
 
-    for batch_S_norm, batch_t_norm, batch_K_norm, batch_sigma_norm, batch_price_data in dataloader:
-        # Move batch to device
-        batch_S_norm = batch_S_norm.to(device)
-        batch_t_norm = batch_t_norm.to(device)
-        batch_K_norm = batch_K_norm.to(device)
-        batch_sigma_norm = batch_sigma_norm.to(device)
-        batch_price_data = batch_price_data.to(device)
+    for S_cpu, t_cpu, K_cpu, sig_cpu, y_cpu in dataloader:
+        # 2A) send to GPU
+        S_b   = S_cpu.to(device,   non_blocking=True)
+        t_b   = t_cpu.to(device,   non_blocking=True)
+        K_b   = K_cpu.to(device,   non_blocking=True)
+        sig_b = sig_cpu.to(device, non_blocking=True)
+        y_b   = y_cpu.to(device,   non_blocking=True)
 
         optimizer.zero_grad()
 
-        # Calculate individual losses for the current batch
-        loss_d_batch = data_loss_fn(model, batch_S_norm, batch_t_norm, batch_K_norm, batch_sigma_norm, batch_price_data)
-        loss_p_batch = pde_loss_fn(model, batch_S_norm, batch_t_norm, batch_K_norm, batch_sigma_norm, r_fixed, norm_constants)
+        # 2B) data loss under mixed‑precision
+        with autocast():
+            ld = data_loss_fn(model, S_b, t_b, K_b, sig_b, y_b)
 
-        # Calculate combined loss using learnable log variances
-        # Precision term = exp(-log_var) = 1/variance
-        precision_data = torch.exp(-log_var_data)
-        precision_pde = torch.exp(-log_var_pde)
+        # 2C) PDE loss in full precision (outside autocast)
+        lp = pde_loss_fn(model, S_b, t_b, K_b, sig_b, r_fixed, norm_constants)
 
-        total_loss_batch = precision_data * loss_d_batch + 0.5 * log_var_data + \
-                           precision_pde * loss_p_batch + 0.5 * log_var_pde
+        # 2D) combine under autocast so Tensor Cores still help with the multipliers
+        with autocast():
+            pd = torch.exp(-log_var_data)
+            pp = torch.exp(-log_var_pde)
+            loss = pd * ld + 0.5 * log_var_data + pp * lp + 0.5 * log_var_pde
 
-        # Backpropagation on the combined loss
-        total_loss_batch.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-        # Accumulate losses for epoch logging
-        epoch_loss_total += total_loss_batch.item()
-        epoch_loss_data += loss_d_batch.item() # Log unweighted data loss
-        epoch_loss_pde += loss_p_batch.item()   # Log unweighted pde loss
-        num_batches += 1
+        tot_d += ld.item()
+        tot_p += lp.item()
+        tot_t += loss.item()
+        batches += 1
 
-    # Calculate average losses for the epoch
-    avg_loss_total = epoch_loss_total / num_batches
-    avg_loss_data = epoch_loss_data / num_batches
-    avg_loss_pde = epoch_loss_pde / num_batches
+    if batches > 0:
+        avg_d = tot_d / batches
+        avg_p = tot_p / batches
+        avg_t = tot_t / batches
+    else:
+        avg_d = avg_p = avg_t = 0.0
+   
+    scheduler.step(avg_t)
 
-    # Scheduler step based on average epoch loss
-    scheduler.step(avg_loss_total)
-
-    # Logging
-    losses_total_epoch.append(avg_loss_total)
-    losses_data_epoch.append(avg_loss_data)
-    losses_pde_epoch.append(avg_loss_pde)
+    losses_data_epoch.append(avg_d)
+    losses_pde_epoch.append(avg_p)
+    losses_total_epoch.append(avg_t) 
     log_var_data_hist.append(log_var_data.item())
     log_var_pde_hist.append(log_var_pde.item())
 
-    if (epoch + 1) % log_frequency == 0 or epoch == 0:
-        # Calculate effective weights for logging: w = exp(-log_var)
-        eff_w_data = torch.exp(-log_var_data).item()
-        eff_w_pde = torch.exp(-log_var_pde).item()
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss_total:.4e} "
-              f"(Data: {avg_loss_data:.4e}, PDE: {avg_loss_pde:.4e}), "
-              f"Eff Weights (Data: {eff_w_data:.2e}, PDE: {eff_w_pde:.2e}), "
-              f"LogVars (Data: {log_var_data.item():.2f}, PDE: {log_var_pde.item():.2f}), "
+
+    if (epoch+1) % log_frequency == 0 or epoch == 0:
+        print(f"Epoch {epoch+1}/{num_epochs} — Total: {avg_t:.3e}, "
+              f"Data: {avg_d:.3e}, PDE: {avg_p:.3e}, "
+              f"W_data: {torch.exp(-log_var_data):.2e}, "
+              f"W_pde: {torch.exp(-log_var_pde):.2e}, "
               f"LR: {optimizer.param_groups[0]['lr']:.2e}")
 
-end_time = time.time()
-print(f"\nTraining finished in {end_time - start_time:.2f} seconds.")
+
+print(f"Training done in {time.time()-start_time:.1f}s")
 
 # --- Save model ---
 torch.save({
@@ -261,7 +283,7 @@ torch.save({
             # Save the final learned log variances
             'log_var_data': log_var_data.item(),
             'log_var_pde': log_var_pde.item(),
-            'loss': avg_loss_total,
+            'loss': avg_t,
             }, MODEL_SAVE_PATH)
 print(f"Model state saved to {MODEL_SAVE_PATH}")
 
@@ -298,28 +320,36 @@ plt.show()
 print("\nEvaluating model on the full dataset...")
 
 # Ensure data tensors are on the correct device for evaluation
-S_norm = S_norm.to(device)
-t_norm = t_norm.to(device)
-K_norm = K_norm.to(device)
-sigma_norm = sigma_norm.to(device)
-price_data = price_data.to(device) # Target prices
+# S_norm = S_norm.to(device)
+# t_norm = t_norm.to(device)
+# K_norm = K_norm.to(device)
+eval_num_workers = 0
+# sigma_norm = sigma_norm.to(device)
+# price_data = price_data.to(device) # Target prices
 
+# eval_loader = DataLoader(dataset, batch_size=batch_size*2,
+#                          shuffle=False, num_workers=4,
+#                          pin_memory=True, persistent_workers=True)
+
+eval_loader = DataLoader(dataset, batch_size = batch_size*2, 
+                         shuffle = False, 
+                         num_workers = eval_num_workers,
+                         pin_memory = True, 
+                         persistent_workers = True if eval_num_workers > 0 else False) 
 model.eval()
-all_predictions = []
+all_preds = []
+
 with torch.no_grad():
-    eval_dataloader = DataLoader(dataset, batch_size=batch_size * 2, shuffle=False) # Use larger batch for eval
-    for batch_S_norm, batch_t_norm, batch_K_norm, batch_sigma_norm, _ in eval_dataloader:
-        # Move batch to device
-        batch_S_norm = batch_S_norm.to(device)
-        batch_t_norm = batch_t_norm.to(device)
-        batch_K_norm = batch_K_norm.to(device)
-        batch_sigma_norm = batch_sigma_norm.to(device)
+    for S_cpu, t_cpu, K_cpu, sig_cpu, _ in eval_loader:
+        S_b   = S_cpu.to(device,   non_blocking=True)
+        t_b   = t_cpu.to(device,   non_blocking=True)
+        K_b   = K_cpu.to(device,   non_blocking=True)
+        sig_b = sig_cpu.to(device, non_blocking=True)
 
-        batch_preds = model(batch_S_norm, batch_t_norm, batch_K_norm, batch_sigma_norm)
-        all_predictions.append(batch_preds.cpu()) # Move predictions to CPU
+        preds = model(S_b, t_b, K_b, sig_b)
+        all_preds.append(preds.cpu())
 
-predictions = torch.cat(all_predictions).numpy().flatten()
-
+predictions = torch.cat(all_preds).numpy().flatten()
 
 # Example check:
 if len(predictions) != len(df):
@@ -351,18 +381,128 @@ if df_output is not None:
     df_output.to_csv(output_csv_path, index=False)
     print(f"Predictions saved to {output_csv_path}")
 
-    # --- Plotting ---
     print("Generating plots...")
+    # Plot subset for clarity if dataset is large
     plot_subset = df_output.sample(n=min(5000, len(df_output)), random_state=1) if len(df_output) > 5000 else df_output
+    print(f"Generating plots using a subset of {len(plot_subset)} points.")
+
+    # --- Plot 1: Time Series Comparison (Split) ---
+
+    # 1a) PINN vs Black-Scholes
     plt.figure(figsize=(12, 6))
-    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['C_LAST'], label='Market Price', alpha=0.3, s=5)
-    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['PINN_PREDICTION'], label='PINN Prediction', alpha=0.3, s=5)
-    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['BS_PREDICTION'], label='Black-Scholes (C_IV)', alpha=0.3, s=5)
-    plt.xlabel("Quote Date"); plt.ylabel("Call Price"); plt.title(f"AAPL Call Option Predictions (Subset)"); plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
+    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['PINN_PREDICTION'], label='PINN Prediction', alpha=0.5, s=10, color='red')
+    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['BS_PREDICTION'], label='Black-Scholes (C_IV)', alpha=0.5, s=10, color='blue')
+    plt.xlabel("Quote Date")
+    plt.ylabel("Call Price")
+    plt.title(f"PINN vs Black-Scholes Predictions (Subset)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 1b) Market Price vs Black-Scholes
+    plt.figure(figsize=(12, 6))
+    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['C_LAST'], label='Market Price', alpha=0.5, s=10, color='green')
+    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['BS_PREDICTION'], label='Black-Scholes (C_IV)', alpha=0.5, s=10, color='blue')
+    plt.xlabel("Quote Date")
+    plt.ylabel("Call Price")
+    plt.title(f"Market Price vs Black-Scholes Predictions (Subset)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # 1c) Market Price vs PINN
+    plt.figure(figsize=(12, 6))
+    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['C_LAST'], label='Market Price', alpha=0.5, s=10, color='green')
+    plt.scatter(plot_subset['QUOTE_DATE'], plot_subset['PINN_PREDICTION'], label='PINN Prediction', alpha=0.5, s=10, color='red')
+    plt.xlabel("Quote Date")
+    plt.ylabel("Call Price")
+    plt.title(f"Market Price vs PINN Predictions (Subset)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Plot 2: Prediction Error vs Strike (Unchanged) ---
     plt.figure(figsize=(10, 6))
-    plt.scatter(plot_subset['STRIKE'], plot_subset['C_LAST'] - plot_subset['PINN_PREDICTION'], alpha=0.3, s=5, label='PINN Error')
-    plt.scatter(plot_subset['STRIKE'], plot_subset['C_LAST'] - plot_subset['BS_PREDICTION'], alpha=0.3, s=5, label='BS Error')
-    plt.axhline(0, color='black', linestyle='--', linewidth=1); plt.xlabel("Strike Price"); plt.ylabel("Prediction Error"); plt.title(f"Prediction Error vs Strike (Subset)"); plt.legend(); plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
+    # Calculate errors on the subset
+    pinn_error_subset = plot_subset['C_LAST'] - plot_subset['PINN_PREDICTION']
+    bs_error_subset = plot_subset['C_LAST'] - plot_subset['BS_PREDICTION']
+    plt.scatter(plot_subset['STRIKE'], pinn_error_subset, alpha=0.3, s=5, label='PINN Error', color='red')
+    plt.scatter(plot_subset['STRIKE'], bs_error_subset, alpha=0.3, s=5, label='BS Error', color='blue')
+    plt.axhline(0, color='black', linestyle='--', linewidth=1)
+    plt.xlabel("Strike Price")
+    plt.ylabel("Prediction Error (Market - Prediction)")
+    plt.title(f"Prediction Error vs Strike (Subset)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Plot 3: Prediction vs Actual Scatter Plot (New) ---
+    min_price = min(plot_subset['C_LAST'].min(), plot_subset['PINN_PREDICTION'].min(), plot_subset['BS_PREDICTION'].min())
+    max_price = max(plot_subset['C_LAST'].max(), plot_subset['PINN_PREDICTION'].max(), plot_subset['BS_PREDICTION'].max())
+    # Add some padding
+    min_price = max(0, min_price - (max_price - min_price) * 0.1) # Ensure min is not negative
+    max_price = max_price + (max_price - min_price) * 0.1
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+    fig.suptitle('Prediction vs. Actual Market Price (Subset)')
+
+    # PINN vs Actual
+    axes[0].scatter(plot_subset['C_LAST'], plot_subset['PINN_PREDICTION'], alpha=0.3, s=10, color='red')
+    axes[0].plot([min_price, max_price], [min_price, max_price], 'k--', label='y=x')
+    axes[0].set_xlabel("Actual Market Price (C_LAST)")
+    axes[0].set_ylabel("Predicted Price")
+    axes[0].set_title("PINN Prediction")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_xlim(min_price, max_price)
+    axes[0].set_ylim(min_price, max_price)
+    axes[0].legend()
+
+    # Black-Scholes vs Actual
+    axes[1].scatter(plot_subset['C_LAST'], plot_subset['BS_PREDICTION'], alpha=0.3, s=10, color='blue')
+    axes[1].plot([min_price, max_price], [min_price, max_price], 'k--', label='y=x')
+    axes[1].set_xlabel("Actual Market Price (C_LAST)")
+    axes[1].set_ylabel("Predicted Price")
+    axes[1].set_title("Black-Scholes Prediction")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout to prevent title overlap
+    plt.show()
+
+    # --- Plot 4: Error Distribution Histogram (New) ---
+    plt.figure(figsize=(10, 6))
+    # Use errors calculated earlier for the subset
+    plt.hist(pinn_error_subset.dropna(), bins=75, alpha=0.7, label='PINN Error', density=True, color='red')
+    plt.hist(bs_error_subset.dropna(), bins=75, alpha=0.7, label='BS Error', density=True, color='blue')
+    plt.axvline(0, color='black', linestyle='--', linewidth=1, label='Zero Error')
+    plt.xlabel("Prediction Error (Market - Prediction)")
+    plt.ylabel("Density")
+    plt.title("Distribution of Prediction Errors (Subset)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+    # --- Plot 5: Error vs Moneyness (New) ---
+    # Calculate moneyness (S/K) for the subset
+    moneyness_subset = plot_subset['UNDERLYING_LAST'] / plot_subset['STRIKE']
+
+    plt.figure(figsize=(10, 6))
+    plt.scatter(moneyness_subset, pinn_error_subset, alpha=0.3, s=5, label='PINN Error', color='red')
+    plt.scatter(moneyness_subset, bs_error_subset, alpha=0.3, s=5, label='BS Error', color='blue')
+    plt.axhline(0, color='black', linestyle='--', linewidth=1)
+    plt.axvline(1.0, color='grey', linestyle=':', linewidth=1, label='At-The-Money (S/K=1)') # Mark ATM
+    plt.xlabel("Moneyness (S / K)")
+    plt.ylabel("Prediction Error (Market - Prediction)")
+    plt.title("Prediction Error vs Moneyness (Subset)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
 else:
      print("Skipping evaluation plots and CSV output due to data alignment issues.")
