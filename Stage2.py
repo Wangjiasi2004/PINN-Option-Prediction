@@ -72,10 +72,10 @@ def load_and_preprocess_data(csv_path):
 # --- Normalization Functions ---
 def calculate_norm_constants(df_train):
     print("Calculating normalization constants from training data...")
-    S_data = torch.tensor(df_train['UNDERLYING_LAST'].values, dtype=torch.float32).unsqueeze(1)
-    t_data = torch.tensor(df_train['t_years'].values, dtype=torch.float32).unsqueeze(1)
-    K_data = torch.tensor(df_train['STRIKE'].values, dtype=torch.float32).unsqueeze(1)
-    sigma_data = torch.tensor(df_train['C_IV'].values, dtype=torch.float32).unsqueeze(1)
+    S_data = torch.tensor(df_train['UNDERLYING_LAST'].values, dtype = torch.float32).unsqueeze(1)
+    t_data = torch.tensor(df_train['t_years'].values, dtype = torch.float32).unsqueeze(1)
+    K_data = torch.tensor(df_train['STRIKE'].values, dtype = torch.float32).unsqueeze(1)
+    sigma_data = torch.tensor(df_train['C_IV'].values, dtype = torch.float32).unsqueeze(1)
 
     S_mean, S_std = S_data.mean(), S_data.std().clamp_min(1e-8)
     t_mean, t_std = t_data.mean(), t_data.std().clamp_min(1e-8)
@@ -118,9 +118,7 @@ class MarketPINN(nn.Module):
             nn.Linear(hidden_dim, 1),
             nn.ReLU()
         )
-        # for m in self.net.modules():
-        #     if isinstance(m, nn.Linear):
-        #         nn.init.xavier_uniform_(m.weight); nn.init.zeros_(m.bias)
+
         for m in self.net:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -401,10 +399,7 @@ if __name__ == "__main__":
         saved_norm_constants = checkpoint['norm_constants']
         norm_constants = {k: torch.tensor(v).to(DEVICE) for k, v in saved_norm_constants.items()}
         print("Model loaded.")
-        # Optionally load optimizer state if you want to resume training
-        # optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        # log_var_data = nn.Parameter(torch.tensor(checkpoint['final_log_var_data'], device=DEVICE))
-        # log_var_pde = nn.Parameter(torch.tensor(checkpoint['final_log_var_pde'], device=DEVICE))
+
         train_info = None # No training info if loading
     else:
         # 6. Train the model

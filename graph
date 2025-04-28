@@ -1,0 +1,123 @@
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import numpy as np
+
+# --- Configuration ---
+input_neurons = 4
+hidden_layers = 3
+hidden_neurons = 4 # Assumption: number of neurons per hidden layer
+output_neurons = 1
+
+layer_sizes = [input_neurons] + [hidden_neurons] * hidden_layers + [output_neurons]
+
+layer_sep = 2.5       # Horizontal distance between layers
+node_sep = 1.2        # Vertical distance between nodes within a layer
+node_radius = 0.4
+input_labels = [r'$S_n$', r'$t_n$', r'$K_n$', r'$\sigma_n$'] # Using LaTeX
+output_label = 'Option Price'
+hidden_activation = 'Tanh'
+output_activation = 'ReLU'
+
+# --- Calculate Node Positions ---
+positions = []
+max_nodes_in_layer = max(layer_sizes)
+for i, size in enumerate(layer_sizes):
+    layer_x = i * layer_sep
+    # Calculate vertical offset to center the layer
+    total_height = (size - 1) * node_sep
+    start_y = -total_height / 2.0
+    layer_positions = [(layer_x, start_y + j * node_sep) for j in range(size)]
+    positions.append(layer_positions)
+
+# --- Create Plot ---
+# Increase figure height slightly to accommodate label below output node
+fig_width = layer_sep * (len(layer_sizes)) + 3 # Adjust width based on layers + labels
+fig_height = max_nodes_in_layer * node_sep + 1.5 # Increased height slightly
+fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+ax.axis('off') # Turn off the axis lines and labels
+
+# --- Draw Connections (Fully Connected) ---
+# Draw lines first so nodes appear on top (zorder)
+for i in range(len(layer_sizes) - 1):
+    for start_node_pos in positions[i]:
+        for end_node_pos in positions[i+1]:
+            # Draw line from edge of start node to edge of end node
+            ax.plot([start_node_pos[0] + node_radius, end_node_pos[0] - node_radius],
+                    [start_node_pos[1], end_node_pos[1]],
+                    'k-', alpha=0.6, lw=0.8, zorder=1) # Black, slightly transparent lines
+
+# --- Draw Nodes and Add Labels/Activations ---
+node_color = 'skyblue'
+input_node_color = 'lightyellow'
+output_node_color = 'lightpink'
+
+for i, layer_pos in enumerate(positions):
+    layer_x = layer_pos[0][0] # X-coordinate for this layer
+    layer_top_y = max(p[1] for p in layer_pos) + node_sep * 1.2 # Y-pos for activation label
+
+    # Draw Nodes
+    for j, pos in enumerate(layer_pos):
+        node_edge_color = 'black'
+        if i == 0: # Input layer
+            color = input_node_color
+        elif i == len(layer_sizes) - 1: # Output layer
+            color = output_node_color
+        else: # Hidden layers
+            color = node_color
+
+        circle = patches.Circle(pos, node_radius, facecolor=color, edgecolor=node_edge_color, lw=1, zorder=2)
+        ax.add_patch(circle)
+
+        # Add Input Labels
+        if i == 0:
+            ax.text(pos[0] - node_radius * 1.8, pos[1], input_labels[j],
+                    ha='right', va='center', fontsize=12, zorder=3)
+
+    # Add Hidden Layer Activation Labels (above each hidden layer)
+    if 0 < i < len(layer_sizes) - 1:
+        ax.text(layer_x, layer_top_y, hidden_activation, ha='center', va='center', fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.3", fc="lightgreen", ec="grey", lw=0.5, alpha=0.8))
+
+    # Add Output Label and Activation
+    if i == len(layer_sizes) - 1:
+        output_pos = layer_pos[0] # Position of the single output node
+
+        # --- MODIFIED PLACEMENT for "Option Price" label ---
+        # Output Node Label (Placed BELOW the node)
+        ax.text(output_pos[0],                        # Centered horizontally with the node
+                output_pos[1] - node_radius * 1.8,    # Positioned below the node
+                output_label,
+                ha='center',                          # Horizontal Alignment: Center
+                va='top',                             # Vertical Alignment: Top of text aligns with y-coord
+                fontsize=12, zorder=3)
+        # --- END MODIFICATION ---
+
+        # Output Activation (placed after the node - unchanged)
+        activation_x_pos = output_pos[0] + layer_sep * 0.7
+        ax.text(activation_x_pos, output_pos[1], output_activation, ha='center', va='center', fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.3", fc="lightcoral", ec="grey", lw=0.5, alpha=0.8), zorder=3)
+        # Arrow from output node to activation function (unchanged)
+        ax.annotate("",
+                    xy=(activation_x_pos - node_radius * 1.5, output_pos[1]), # Point to edge of text box
+                    xytext=(output_pos[0] + node_radius, output_pos[1]), # Start from edge of node
+                    arrowprops=dict(arrowstyle="->", color='black', lw=1.5),
+                    zorder=1)
+
+
+# --- Final Adjustments ---
+# Set plot limits dynamically with padding
+min_x = positions[0][0][0] - node_radius - 1.5 # Space for input labels
+max_x = positions[-1][0][0] + node_radius + 2.5 # Space for output label/activation
+all_y = [p[1] for layer in positions for p in layer]
+min_y = min(all_y) - node_radius - 1.5 # Adjusted padding slightly below
+max_y = max(all_y) + node_radius + 1.5 # Padding above (for activation labels)
+ax.set_xlim(min_x, max_x)
+ax.set_ylim(min_y, max_y)
+
+plt.title("Artificial Neural Network Architecture", fontsize=14, y=0.98) # Adjust title position if needed
+plt.tight_layout() # Helps arrange elements neatly
+plt.show() # Display the plot
+
+# To save as a vector graphic (e.g., SVG or PDF for reports):
+# plt.savefig("ann_architecture_fixed.svg", format="svg", bbox_inches='tight')
+# plt.savefig("ann_architecture_fixed.pdf", format="pdf", bbox_inches='tight')
